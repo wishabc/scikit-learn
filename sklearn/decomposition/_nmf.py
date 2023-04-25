@@ -74,7 +74,7 @@ def _check_init(A, shape, whom):
         raise ValueError("Array passed to %s is full of zeros." % whom)
 
 
-def _beta_divergence(X, W, H, beta, square_root=False):
+def _beta_divergence(X, W, H, beta, square_root=False, weights=None):
     """Compute the beta-divergence of X and dot(W, H).
 
     Parameters
@@ -91,6 +91,8 @@ def _beta_divergence(X, W, H, beta, square_root=False):
         If beta == 1, this is the generalized Kullback-Leibler divergence.
         If beta == 0, this is the Itakura-Saito divergence.
         Else, this is the general beta-divergence.
+
+    weights : TODO
 
     square_root : bool, default=False
         If True, return np.sqrt(2 * res)
@@ -113,18 +115,25 @@ def _beta_divergence(X, W, H, beta, square_root=False):
     if beta == 2:
         # Avoid the creation of the dense np.dot(W, H) if X is sparse.
         if sp.issparse(X):
+            if weights is not None:
+                raise NotImplementedError()
             norm_X = np.dot(X.data, X.data)
             norm_WH = trace_dot(np.linalg.multi_dot([W.T, W, H]), H)
             cross_prod = trace_dot((X * H.T), W)
             res = (norm_X + norm_WH - 2.0 * cross_prod) / 2.0
         else:
-            res = squared_norm(X - np.dot(W, H)) / 2.0
+            if weights is None:
+                res = squared_norm(X - np.dot(W, H)) / 2.0
+            else:
+                K = np.ravel((X - np.dot(W, H)) * np.sqrt(weights[:, None]))
+                res = np.dot(K, K) / 2.0
 
         if square_root:
             return np.sqrt(res * 2)
         else:
             return res
-
+    if weights is not None:
+        raise NotImplementedError()
     if sp.issparse(X):
         # compute np.dot(W, H) only where X is nonzero
         WH_data = _special_sparse_dot(W, H, X).data
@@ -527,6 +536,7 @@ def _multiplicative_update_w(
     HHt=None,
     XHt=None,
     update_H=True,
+    weights=None
 ):
     """Update W in Multiplicative Update NMF."""
     if beta_loss == 2:
@@ -543,9 +553,14 @@ def _multiplicative_update_w(
         # Denominator
         if HHt is None:
             HHt = np.dot(H, H.T)
-        denominator = np.dot(W, HHt)
 
+        if weights is None:
+            denominator = np.dot(W, HHt)
+        else:
+            denominator = np.dot(weights[:, None] * W, HHt)
     else:
+        if weights is not None:
+            raise NotImplementedError
         # Numerator
         # if X is sparse, compute WH only where X is non zero
         WH_safe_X = _special_sparse_dot(W, H, X)
@@ -624,12 +639,15 @@ def _multiplicative_update_w(
 
 
 def _multiplicative_update_h(
-    X, W, H, beta_loss, l1_reg_H, l2_reg_H, gamma, A=None, B=None, rho=None
+    X, W, H, beta_loss, l1_reg_H, l2_reg_H, gamma, A=None, B=None, rho=None, weights=None
 ):
     """update H in Multiplicative Update NMF."""
     if beta_loss == 2:
         numerator = safe_sparse_dot(W.T, X)
-        denominator = np.linalg.multi_dot([W.T, W, H])
+        if weights is None:
+            denominator = np.linalg.multi_dot([W.T, W, H])
+        else:
+            denominator = np.linalg.multi_dot([W.T, weights[:, None] * W, H])
 
     else:
         # Numerator
@@ -733,6 +751,7 @@ def _fit_multiplicative_update(
     l2_reg_H=0,
     update_H=True,
     verbose=0,
+    weights=None
 ):
     """Compute Non-negative Matrix Factorization with Multiplicative Update.
 
@@ -785,6 +804,8 @@ def _fit_multiplicative_update(
     verbose : int, default=0
         The verbosity level.
 
+    weights : TODO
+
     Returns
     -------
     W : ndarray of shape (n_samples, n_components)
@@ -816,10 +837,15 @@ def _fit_multiplicative_update(
         gamma = 1.0
 
     # used for the convergence criterion
-    error_at_init = _beta_divergence(X, W, H, beta_loss, square_root=True)
+    error_at_init = _beta_divergence(X, W, H, beta_loss, square_root=True, weights=weights)
     previous_error = error_at_init
 
     H_sum, HHt, XHt = None, None, None
+    if weights is not None:
+        if sp.issparse(X):
+            X = X.multiply(weights[:, None])
+        else:
+            X = X * weights[:, None]
     for n_iter in range(1, max_iter + 1):
         # update W
         # H_sum, HHt and XHt are saved and reused if not update_H
@@ -835,6 +861,7 @@ def _fit_multiplicative_update(
             HHt=HHt,
             XHt=XHt,
             update_H=update_H,
+            weights=weights
         )
 
         # necessary for stability with beta_loss < 1
@@ -851,6 +878,7 @@ def _fit_multiplicative_update(
                 l1_reg_H=l1_reg_H,
                 l2_reg_H=l2_reg_H,
                 gamma=gamma,
+                weights=weights
             )
 
             # These values will be recomputed since H changed
@@ -1538,7 +1566,7 @@ class NMF(_BaseNMF):
 
         return self
 
-    def fit_transform(self, X, y=None, W=None, H=None):
+    def fit_transform(self, X, y=None, W=None, H=None, weights=None):
         """Learn a NMF model for the data X and returns the transformed data.
 
         This is more efficient than calling fit followed by transform.
@@ -1560,6 +1588,9 @@ class NMF(_BaseNMF):
             If `init='custom'`, it is used as initial guess for the solution.
             If `None`, uses the initialisation method specified in `init`.
 
+        weights : array-like of shape (n_samples), default=None.
+            Sample weights for NMF
+
         Returns
         -------
         W : ndarray of shape (n_samples, n_components)
@@ -1570,12 +1601,13 @@ class NMF(_BaseNMF):
         X = self._validate_data(
             X, accept_sparse=("csr", "csc"), dtype=[np.float64, np.float32]
         )
-
+        if weights and self.beta_loss != 'frobenius':
+            raise NotImplementedError
         with config_context(assume_finite=True):
-            W, H, n_iter = self._fit_transform(X, W=W, H=H)
+            W, H, n_iter = self._fit_transform(X, W=W, H=H, weights=weights)
 
         self.reconstruction_err_ = _beta_divergence(
-            X, W, H, self._beta_loss, square_root=True
+            X, W, H, self._beta_loss, square_root=True, weights=weights
         )
 
         self.n_components_ = H.shape[0]
@@ -1584,7 +1616,7 @@ class NMF(_BaseNMF):
 
         return W
 
-    def _fit_transform(self, X, y=None, W=None, H=None, update_H=True):
+    def _fit_transform(self, X, y=None, W=None, H=None, update_H=True, weights=None):
         """Learn a NMF model for the data X and returns the transformed data.
 
         Parameters
@@ -1612,6 +1644,8 @@ class NMF(_BaseNMF):
             If False, only W will be estimated, this corresponds to a call
             to the 'transform' method.
 
+        weights : array-like of shape (n_samples). Weights of samples in NMF
+
         Returns
         -------
         W : ndarray of shape (n_samples, n_components)
@@ -1637,7 +1671,7 @@ class NMF(_BaseNMF):
 
         # initialize or check W and H
         W, H = self._check_w_h(X, W, H, update_H)
-
+        weights = np.array(weights)  # FIXME
         # scale the regularization terms
         l1_reg_W, l1_reg_H, l2_reg_W, l2_reg_H = self._compute_regularization(X)
 
@@ -1671,6 +1705,7 @@ class NMF(_BaseNMF):
                 l2_reg_H,
                 update_H,
                 self.verbose,
+                weights=weights
             )
         else:
             raise ValueError("Invalid solver parameter '%s'." % self.solver)
